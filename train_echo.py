@@ -42,6 +42,9 @@ from advantages import compute_multiturn_advantages
 
 load_dotenv()
 
+WANDB_ENTITY  = "sifat-anindho-colorado-state-university"
+WANDB_PROJECT = "echo-edp"
+
 os.environ['TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC'] = '1800'
 os.environ['TORCH_NCCL_ENABLE_MONITORING']      = '0'
 os.environ["HF_HUB_OFFLINE"]                    = "1"
@@ -440,21 +443,21 @@ class ECHOTrainer(GRPOTrainer):
         if self.beta != 0.0:
             with torch.no_grad():
                 if self.ref_model is not None:
-                    ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                    ref_per_token_logps, _, _ = self._get_per_token_logps_and_entropies(
                         self.ref_model, prompt_completion_ids, attention_mask_full,
                         max_c, batch_size=self.args.per_device_train_batch_size,
                         compute_entropy=False,
                     )
                 else:
                     with self.accelerator.unwrap_model(self.model).disable_adapter():
-                        ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                        ref_per_token_logps, _, _ = self._get_per_token_logps_and_entropies(
                             self.model, prompt_completion_ids, attention_mask_full,
                             max_c, batch_size=self.args.per_device_train_batch_size,
                             compute_entropy=False,
                         )
 
         with torch.no_grad():
-            old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+            old_per_token_logps, _, _ = self._get_per_token_logps_and_entropies(
                 self.model, prompt_completion_ids, attention_mask_full,
                 max_c, batch_size=self.args.per_device_train_batch_size,
                 compute_entropy=False,
@@ -693,7 +696,6 @@ def build_grpo_config(run_name, output_dir, policy_model="Qwen/Qwen2.5-1.5B-Inst
         num_generations              = num_generations,
         generation_batch_size        = per_device_train_batch_size * num_generations,
         steps_per_generation         = num_generations,
-        max_prompt_length            = max_prompt_length,
         max_completion_length        = max_completion_length,
         max_steps                    = max_steps,
         learning_rate                = learning_rate,
@@ -719,7 +721,9 @@ def train(
     max_steps      = 350,
     save_every     = 100,
     policy_model   = "Qwen/Qwen2.5-1.5B-Instruct",
-    report_to      = "none",
+    report_to      = "wandb",
+    wandb_entity   = WANDB_ENTITY,
+    wandb_project  = WANDB_PROJECT,
     log_dir        = None,
 ):
     log_dir = Path(log_dir or "clue_grpo_echo")
@@ -756,9 +760,10 @@ def train(
             task_type=TaskType.CAUSAL_LM,
             target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
         )
+        model_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         base_model = AutoModelForCausalLM.from_pretrained(
             policy_model, torch_dtype=torch.bfloat16
-        ).to("cuda:0")
+        ).to(model_device)
         model = get_peft_model(base_model, lora_config)
         model.print_trainable_parameters()
 
@@ -781,6 +786,17 @@ def train(
         )
 
         try:
+            if "wandb" in str(report_to).lower():
+                os.environ["WANDB_ENTITY"] = wandb_entity
+                os.environ["WANDB_PROJECT"] = wandb_project
+                if wandb.run is None:
+                    wandb.init(
+                        entity=wandb_entity,
+                        project=wandb_project,
+                        name=run_name,
+                        dir=str(run_dir),
+                        reinit=True,
+                    )
             trainer.train()
             trainer.save_model(str(run_dir / "final_model"))
             trainer.state.save_to_json(str(run_dir / "trainer_state.json"))
@@ -791,6 +807,8 @@ def train(
             traceback.print_exc()
             print(f"seed={seed} failed — continuing")
         finally:
+            if wandb.run is not None:
+                wandb.finish()
             del trainer, model, clue_reward
             torch.cuda.empty_cache()
             gc.collect()
@@ -815,7 +833,9 @@ if __name__ == "__main__":
     parser.add_argument("--steps",    type=int,  default=350)
     parser.add_argument("--model",    type=str,  default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--log-dir",  type=str,  default="clue_grpo_echo")
-    parser.add_argument("--report-to",type=str,  default="none")
+    parser.add_argument("--report-to",type=str,  default="wandb")
+    parser.add_argument("--wandb-entity", type=str, default=WANDB_ENTITY)
+    parser.add_argument("--wandb-project", type=str, default=WANDB_PROJECT)
     parser.add_argument("--save-every",type=int, default=100)
     args = parser.parse_args()
 
@@ -825,5 +845,7 @@ if __name__ == "__main__":
         policy_model = args.model,
         log_dir    = args.log_dir,
         report_to  = args.report_to,
+        wandb_entity = args.wandb_entity,
+        wandb_project = args.wandb_project,
         save_every = args.save_every,
     )
