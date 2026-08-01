@@ -7,7 +7,21 @@ Code for ECHO preprint— experiments conducted February–April 2026 at Signal 
 
 ECHO (Epistemic Credit for History-Conditioned Optimization) trains a policy $\pi_\theta$ (shown in the figure above) to adaptively seek information through multi-turn interaction. The key idea: normalize rewards at each turn depth across parallel rollouts of the same problem, giving a belief-state-aware credit signal without explicit value estimation or reasoning traces.
 
-The testbed is the **Clue Selector Game (CSG)** — a 5-arm bandit where the agent asks property questions to identify a secret number. Belief state is the remaining candidate set; the oracle is GPT-4o-mini.
+The testbed is the **Clue Selector Game (CSG)** — a 5-arm bandit where the agent asks property questions to identify a secret number. Belief state is the remaining candidate set; the oracle is GPT-4o-mini. Full episode logs are available in this [Clue Selector Game: ECHO Dataset](https://huggingface.co/datasets/Abhijnan/clue-selector-game-echo)
+
+## Citation
+
+If you use this dataset or code, please cite:
+
+```bibtex
+@article{nath2026echo,
+  title   = {ECHO: Learning Epistemically Adaptive Language Agents with Turn-Level Credit},
+  author  = {Nath, Abhijnan and Krishnaswamy, Nikhil},
+  journal = {arXiv preprint arXiv:2606.29745},
+  year    = {2026}
+}
+```
+
 
 ## Results
 
@@ -86,11 +100,41 @@ Results saved to `eval_results/per_target/`.
 
 The evaluation dataset and all episode logs are available on HuggingFace. To reproduce the per-stratum results table from the paper:
 
+## Recompute Main Evaluation Metrics
+
+Install the required dependencies:
+
+```bash
+pip install datasets pyarrow pandas numpy
+```
+
+Recompute metrics from the Hugging Face dataset:
+
+```bash
+python recompute_csg_main_metrics_from_hf.py \
+  --dataset abhijnan-nath/clue-selector-game-echo \
+  --output-dir ./csg_main_metrics
+```
+
+Or run from a locally saved Hugging Face `DatasetDict`:
+
+```bash
+python recompute_csg_main_metrics_from_hf.py \
+  --dataset ./hf_public_csg_dataset/dataset_dict \
+  --output-dir ./csg_main_metrics
+```
+
+The final model-level results are saved to:
+
+```text
+csg_main_metrics/model_metrics.csv
+```
+
+
 ```bash
 python results.py   # run from a machine with pyarrow installed
 ```
 
 ---
 
-## Citation
  
