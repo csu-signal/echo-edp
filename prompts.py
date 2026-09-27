@@ -4,6 +4,17 @@ Prompt templates for the Clue Selector Game (CSG).
 
 SYSTEM_PROMPT = "You are a helpful assistant. Follow instructions exactly."
 
+REACT_SYSTEM_PROMPT = (
+    "You are solving a number guessing game using ReAct "
+    "(Reasoning + Acting).\n"
+    "At each turn: write a Thought about what you learned "
+    "from past observations and what to do next, "
+    "then write your Action as JSON.\n\n"
+    "Format:\n"
+    "Thought: <reasoning>\n"
+    "Action: {\"arm\": <0-4>, \"question\": \"<question>\"}"
+)
+
 ORACLE_SYSTEM_PROMPT = "You are a clue holder in a number guessing game. Return one sentence only."
 
 ORACLE_PROMPT_TEMPLATE = """You know the secret number is {secret}.
@@ -52,3 +63,41 @@ Do NOT repeat a question already asked to any arm.
 Pick the arm with the most remaining information and ask a precise property question.
 
 Respond with JSON only: {{"arm": <0 to {n_arms-1}>, "question": "<precise property question>"}}"""
+
+
+def build_react_prompt(candidates, react_history, turn, max_turns, n_arms):
+    """
+    Build the prompt sent to the ReAct selector each turn.
+    react_history is a list of (raw_response, observation) tuples.
+    """
+    base_prompt = (
+        f"Turn {turn+1} of {max_turns}\n"
+        f"Remaining candidates ({len(candidates)}): {candidates}\n\n"
+        f"You have {n_arms} clue holders (arms 0-{n_arms-1}), "
+        f"each knowing specific facts about the number.\n\n"
+        "Good questions ask about:\n"
+        "- parity (odd/even)\n"
+        "- range (greater/less than a value)\n"
+        "- divisibility (by 3, 5, 7, etc.)\n"
+        "- primality, perfect square\n"
+        "- digit properties (sum of digits, last digit)\n\n"
+        "Do NOT repeat a question already asked to any arm.\n"
+    )
+
+    if react_history:
+        history_text = "Past interactions:\n"
+        for i, (thought_action, observation) in enumerate(react_history):
+            history_text += f"\n--- Turn {i+1} ---\n"
+            history_text += f"{thought_action}\n"
+            history_text += f"Observation: {observation}\n"
+        full_prompt = history_text + "\n" + base_prompt
+    else:
+        full_prompt = base_prompt
+
+    full_prompt += (
+        f"\nRespond with:\n"
+        f"Thought: <your reasoning>\n"
+        f"Action: {{\"arm\": <0-{n_arms-1}>, "
+        f"\"question\": \"<question>\"}}"
+    )
+    return full_prompt
