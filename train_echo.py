@@ -43,7 +43,7 @@ from advantages import compute_multiturn_advantages
 load_dotenv()
 
 WANDB_ENTITY  = "sifat-anindho-colorado-state-university"
-WANDB_PROJECT = "echo-edp"
+WANDB_PROJECT = "clue_echo"
 
 os.environ['TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC'] = '1800'
 os.environ['TORCH_NCCL_ENABLE_MONITORING']      = '0'
