@@ -1,0 +1,28 @@
+{
+  "constants": {
+    "MAX_TURNS": 10,
+    "GROUND_THRESHOLD": 0.5,
+    "LATE_TURN_MIN": 5,
+    "NARROW_CANDIDATE_MAX": 10,
+    "REASON_OUTSIDE_JSON_MIN_CHARS": 10,
+    "REASON_NO_ACTION_JSON_MIN_CHARS": 50
+  },
+  "metrics": [
+    "Resolve",
+    "Zero",
+    "Qual",
+    "Ground",
+    "LateCalib",
+    "ReasonPct",
+    "ZeroEvents",
+    "Rec1",
+    "GRecover",
+    "RecQ",
+    "NextZero",
+    "NextBad",
+    "TTR",
+    "TTRsucc",
+    "ResAfterZero"
+  ],
+  "aggregation": "Metrics are computed per run; model means and SEMs are then computed with equal weight per run."
+}

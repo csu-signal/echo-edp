@@ -37,6 +37,7 @@ import wandb
 from environment import (
     filter_candidates, is_prime, call_clue_holder,
     build_llm_prompt, parse_llm_response, ARM_PROPERTIES, sanitize_hint,
+    POLICY_TOP_K, POLICY_REPETITION_PENALTY,
 )
 from advantages import compute_multiturn_advantages
 
@@ -55,7 +56,8 @@ os.environ["TRANSFORMERS_OFFLINE"]              = "1"
 N_ARMS    = 5
 MAX_TURNS = 10
 
-ADVANTAGE_MODE = "echo"   # ECHO uses cross-generation per-turn normalization
+ADVANTAGE_MODE  = "echo"   # ECHO uses cross-generation per-turn normalization
+ADVANTAGE_MODES = ("echo", "episode_return", "rloo_per_turn")
 
 # ── reward function ───────────────────────────────────────────────────────────
 
@@ -256,8 +258,10 @@ class ECHOTrainer(GRPOTrainer):
         "candidates_before_int", "all_arm_histories_snapshot",
     ]
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, train_micro_batch_size=4, advantage_mode=ADVANTAGE_MODE, **kwargs):
         super().__init__(*args, **kwargs)
+        self.train_micro_batch_size = train_micro_batch_size
+        self.advantage_mode = advantage_mode
         self._clue_logs = {k: [] for k in self.CLUE_LOG_KEYS}
 
         self._clue_reward_func = None
@@ -327,6 +331,58 @@ class ECHOTrainer(GRPOTrainer):
                 self._compute_and_log_clue_metrics(all_infos, all_gsizes, mode)
 
         return inputs
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """Forward+backward in micro-batches of train_micro_batch_size sequences, matching the unchunked loss."""
+        time_before = time.perf_counter()
+        loss = self._chunked_forward_backward(model, inputs)
+        # mirrors GRPOTrainer.training_step; together with _prepare_inputs this advances _step twice per
+        # optimizer step, so a generation batch is drawn every 2 steps and only slices 0 and 2 are trained on
+        self._step += 1
+        self._current_train_step_time += time.perf_counter() - time_before
+        if self._step % self.current_gradient_accumulation_steps == 0:
+            self._metrics["train"]["step_time"].append(self._current_train_step_time)
+            self._current_train_step_time = 0.0
+        return loss
+
+    def _chunked_forward_backward(self, model, inputs):
+        model.train()
+        if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
+            self.optimizer.train()
+
+        inputs = self._prepare_inputs(inputs)
+        total = inputs["advantages"].shape[0]
+        total_tokens = inputs["completion_mask"].sum().clamp(min=1)
+        seq_keys = [k for k, v in inputs.items()
+                    if isinstance(v, torch.Tensor) and v.dim() > 0 and v.shape[0] == total]
+
+        prev_gas = getattr(self, "current_gradient_accumulation_steps", self.args.gradient_accumulation_steps)
+        total_loss = torch.zeros((), device=self.accelerator.device)
+        try:
+            for start in range(0, total, max(1, self.train_micro_batch_size)):
+                end = min(start + self.train_micro_batch_size, total)
+                chunk = {k: (v[start:end] if k in seq_keys else v) for k, v in inputs.items()}
+                # dapo divides by the full slice's num_items_in_batch, kept from inputs; the others
+                # normalize within the chunk, so rescale each chunk to its share of the slice
+                if self.args.loss_type in ("grpo", "dr_grpo"):
+                    scale = total / (end - start)
+                elif self.args.loss_type == "bnpo":
+                    scale = (total_tokens / chunk["completion_mask"].sum().clamp(min=1)).item()
+                elif self.args.loss_type == "dapo":
+                    scale = 1.0
+                else:
+                    raise ValueError(f"chunked training_step does not support loss_type={self.args.loss_type!r}")
+                self.current_gradient_accumulation_steps = prev_gas * scale
+
+                with self.compute_loss_context_manager():
+                    loss = self.compute_loss(model, chunk)
+                self.accelerator.backward(loss)
+                total_loss += loss.detach()
+                del chunk, loss
+        finally:
+            self.current_gradient_accumulation_steps = prev_gas
+
+        return total_loss
 
     def _split_by_episodes(self, output, group_sizes, steps_per_generation):
         ep_per_step    = len(group_sizes) // steps_per_generation
@@ -469,7 +525,7 @@ class ECHOTrainer(GRPOTrainer):
             group_sizes = group_sizes,
             B           = B,
             G           = self.num_generations,
-            mode        = ADVANTAGE_MODE,
+            mode        = self.advantage_mode,
             device      = device,
         )
 
@@ -539,6 +595,8 @@ class ECHOTrainer(GRPOTrainer):
                         do_sample      = True,
                         temperature    = self.args.temperature,
                         top_p          = 0.9,
+                        top_k          = POLICY_TOP_K,
+                        repetition_penalty = POLICY_REPETITION_PENALTY,
                         pad_token_id   = self.processing_class.eos_token_id,
                     )
 
@@ -725,6 +783,8 @@ def train(
     wandb_entity   = WANDB_ENTITY,
     wandb_project  = WANDB_PROJECT,
     log_dir        = None,
+    train_micro_batch_size = 4,
+    advantage_mode = ADVANTAGE_MODE,
 ):
     log_dir = Path(log_dir or "clue_grpo_echo")
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -738,7 +798,7 @@ def train(
         set_seed(seed)
 
         now      = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-        run_name = f"echo_{policy_model.split('/')[-1]}_seed{seed}_{now}"
+        run_name = f"{advantage_mode}_{policy_model.split('/')[-1]}_seed{seed}_{now}"
         run_dir  = log_dir / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -783,6 +843,8 @@ def train(
             args             = grpo_config,
             train_dataset    = train_dataset,
             processing_class = tokenizer,
+            train_micro_batch_size = train_micro_batch_size,
+            advantage_mode   = advantage_mode,
         )
 
         try:
@@ -817,7 +879,7 @@ def train(
         "seeds":        [int(s) for s in seeds],
         "policy_model": policy_model,
         "max_steps":    max_steps,
-        "advantage_mode": ADVANTAGE_MODE,
+        "advantage_mode": advantage_mode,
         "run_dirs":     all_run_dirs,
     }
     with open(log_dir / "manifest.json", "w") as f:
@@ -837,6 +899,10 @@ if __name__ == "__main__":
     parser.add_argument("--wandb-entity", type=str, default=WANDB_ENTITY)
     parser.add_argument("--wandb-project", type=str, default=WANDB_PROJECT)
     parser.add_argument("--save-every",type=int, default=100)
+    parser.add_argument("--train-micro-batch-size", type=int, default=4,
+                        help="sequences per forward+backward chunk; lower if OOM")
+    parser.add_argument("--advantage-mode", type=str, default=ADVANTAGE_MODE, choices=ADVANTAGE_MODES,
+                        help="echo, or a baseline: episode_return (episodic GRPO), rloo_per_turn")
     args = parser.parse_args()
 
     train(
@@ -848,4 +914,6 @@ if __name__ == "__main__":
         wandb_entity = args.wandb_entity,
         wandb_project = args.wandb_project,
         save_every = args.save_every,
+        train_micro_batch_size = args.train_micro_batch_size,
+        advantage_mode = args.advantage_mode,
     )

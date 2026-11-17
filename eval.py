@@ -39,6 +39,7 @@ from openai import OpenAI
 from environment import (
     filter_candidates, call_clue_holder, build_llm_prompt,
     parse_llm_response, ARM_PROPERTIES, sanitize_hint,
+    POLICY_TOP_K, POLICY_REPETITION_PENALTY,
 )
 
 load_dotenv()
@@ -48,7 +49,8 @@ load_dotenv()
 N_ARMS       = 5
 MAX_TURNS    = 10
 DEVICE       = "cuda:0"
-OUT_DIR      = Path("eval_results/per_target")
+RESULTS_DIR  = Path("eval_results")
+OUT_DIR      = RESULTS_DIR / "per_target"
 SECRETS_PATH = Path("eval_results/canonical_secrets.json")
 EVAL_SEEDS   = [42, 123, 7]
 FRONTIER_RUNS= 3
@@ -216,7 +218,9 @@ def run_all_episodes(generate_fn, secrets, desc, max_workers=1):
                 try:
                     results.append(fut.result())
                 except Exception as e:
-                    print(f"[skip] {e}")
+                    print(f"[skip] secret={futures[fut]}: {e!r}")
+    if len(results) < len(secrets):
+        raise RuntimeError(f"{desc}: {len(secrets) - len(results)}/{len(secrets)} episodes failed; not saving")
     return results
 
 # ── aggregate ─────────────────────────────────────────────────────────────────
@@ -283,6 +287,8 @@ def make_local_generator(model, tokenizer, device, temperature=1.0):
                 do_sample      = True,
                 temperature    = temperature,
                 top_p          = 0.9,
+                top_k          = POLICY_TOP_K,
+                repetition_penalty = POLICY_REPETITION_PENALTY,
                 pad_token_id   = tokenizer.eos_token_id,
             )
         return tokenizer.decode(output[0][input_ids.shape[1]:], skip_special_tokens=True).strip()
@@ -344,7 +350,7 @@ def load_base_model(model_id, device):
 # ── eval orchestrator ─────────────────────────────────────────────────────────
 
 def run_eval(args):
-    POLICY_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+    POLICY_MODEL = args.base_model
 
     if args.model_type == "trained":
         tokenizer              = AutoTokenizer.from_pretrained(POLICY_MODEL)
@@ -352,7 +358,7 @@ def run_eval(args):
         tokenizer.padding_side = "left"
 
         for eval_seed in EVAL_SEEDS:
-            target_id = f"echo__{Path(args.checkpoint).parent.name}"
+            target_id = f"echo__{args.label or Path(args.checkpoint).parent.name}"
             run_idx   = eval_seed
             if already_done(target_id, run_idx):
                 print(f"[skip] {target_id} run{run_idx}")
@@ -437,6 +443,8 @@ def display_name(target_id):
     parts = target_id.split("__")
     if parts[0] == "frontier": return f"[F] {parts[1]}"
     if parts[0] == "base":
+        if not parts[1].startswith("qwen"):
+            return f"[B] {parts[1]}"
         size = parts[1].split("-")[1].upper()
         return f"[B] Qwen-{size}"
     return f"[T] {parts[1]}"
@@ -517,7 +525,7 @@ def save_aggregated(grouped):
             agg["stratum_resolve"][stratum] = {"mean": m, "sem": s}
         out[name] = agg
 
-    p = Path("eval_results/aggregated_results.json")
+    p = RESULTS_DIR / "aggregated_results.json"
     with open(p, "w") as f:
         json.dump(out, f, indent=2)
     print(f"\nsaved -> {p}")
@@ -529,6 +537,10 @@ if __name__ == "__main__":
     parser.add_argument("--model-type",  choices=["trained", "base", "frontier"],
                         help="Type of model to evaluate")
     parser.add_argument("--checkpoint",  type=str, help="Path to trained LoRA final_model dir")
+    parser.add_argument("--base-model",  type=str, default="Qwen/Qwen2.5-1.5B-Instruct",
+                        help="Base model the trained LoRA checkpoint was trained on")
+    parser.add_argument("--label",       type=str, default=None,
+                        help="Name for a trained target (default: the checkpoint's parent dir)")
     parser.add_argument("--model-id",    type=str, help="HuggingFace model ID for base eval")
     parser.add_argument("--model-name",  type=str, help="API model name for frontier eval (e.g. gpt-4o)")
     parser.add_argument("--print-only",  action="store_true",

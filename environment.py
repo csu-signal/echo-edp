@@ -23,6 +23,8 @@ from prompts import ORACLE_SYSTEM_PROMPT, ORACLE_PROMPT_TEMPLATE, build_selector
 load_dotenv()
 client    = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 CLUE_MODEL = "gpt-4o-mini"
+POLICY_TOP_K              = 20
+POLICY_REPETITION_PENALTY = 1.1
 
 # ── arm / property definitions ────────────────────────────────────────────────
 

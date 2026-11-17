@@ -1,0 +1,26 @@
+{
+  "target_id": "frontier__gpt-4o",
+  "run_idx": 0,
+  "category": "frontier",
+  "model_name": "gpt-4o",
+  "n_episodes": 20,
+  "episode_resolve_rate": 0.45,
+  "mean_turns_taken": 8.6,
+  "mean_total_reward": 4.336158634587581,
+  "efficiency": 0.5449235481302359,
+  "mean_final_cands": 1.15,
+  "mean_eliminated": 14.40583333333333,
+  "mean_cands_before": 30.424384920634914,
+  "mean_cands_after": 16.01855158730159,
+  "redundancy_rate": 0.01,
+  "diversity_rate": 0.985,
+  "arm_match_rate": 0.19121031746031747,
+  "normalized_reward": 0.5449235481302359,
+  "stratum_resolve": {
+    "favorable": 0.6666666666666666,
+    "hard_in_dist": 0.4,
+    "ood_range": 0.14285714285714285,
+    "structural": 1.0
+  },
+  "episodes_pkl": "eval_results_est/per_target/frontier__gpt-4o__run0.pkl"
+}
