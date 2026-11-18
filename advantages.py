@@ -8,6 +8,7 @@ ECHO ("echo" mode): per-turn cross-generation normalization.
 Baselines included:
   episode_return  — REINFORCE: sum rewards per episode, same value broadcast to all turns
   rloo_per_turn   — leave-one-out per turn
+  igpo            — IGPO: group-pooled turn normalization + turn-level reward-to-go
 """
 
 import torch
@@ -113,7 +114,41 @@ def _rloo_per_turn_advantages(rewards, group_sizes, B, G, device):
     return advantages
 
 
-def compute_multiturn_advantages(rewards, group_sizes, B, G, mode, device, **kwargs):
+def _igpo_advantages(rewards, group_sizes, B, G, device, outcomes=None, gamma=1.0):
+    """
+    IGPO (Wang et al., 2025), "separate" normalization.
+
+    Dense turn rewards are z-scored over all turns of a secret's G episodes, outcomes are
+    z-scored across the G episodes and added on each episode's final turn, and each turn's
+    advantage is the discounted reward-to-go of the normalized rewards.
+    """
+    starts = [0]
+    for gs in group_sizes:
+        starts.append(starts[-1] + gs)
+
+    norm = torch.zeros_like(rewards)
+    for b in range(B):
+        lo, hi = starts[b * G], starts[(b + 1) * G]
+        r = rewards[lo:hi]
+        norm[lo:hi] = (r - r.mean()) / r.std(unbiased=False).clamp_min(1e-4)
+
+    if outcomes is not None:
+        o = outcomes.to(device).view(B, G)
+        o = ((o - o.mean(dim=1, keepdim=True)) / o.std(dim=1, unbiased=False, keepdim=True).clamp_min(1e-4)).view(-1)
+        for ep_idx in range(B * G):
+            norm[starts[ep_idx + 1] - 1] += o[ep_idx]
+
+    advantages = torch.zeros_like(rewards)
+    for ep_idx in range(B * G):
+        running = 0.0
+        for i in range(starts[ep_idx + 1] - 1, starts[ep_idx] - 1, -1):
+            running = norm[i] + gamma * running
+            advantages[i] = running
+
+    return advantages
+
+
+def compute_multiturn_advantages(rewards, group_sizes, B, G, mode, device, outcomes=None, gamma=1.0):
     """
     Dispatcher for all advantage modes.
 
@@ -122,12 +157,22 @@ def compute_multiturn_advantages(rewards, group_sizes, B, G, mode, device, **kwa
         group_sizes : list of ints — turns per episode, len = B*G
         B           : number of secrets in this batch
         G           : number of generations per secret
-        mode        : "echo" | "episode_return" | "rloo_per_turn"
+        mode        : "echo" | "episode_return" | "rloo_per_turn" | "igpo"
         device      : torch device string
+        outcomes    : optional (B*G,) episode outcome rewards; igpo normalizes them separately,
+                      other modes add them to each episode's final turn reward
+        gamma       : turn-level discount for igpo
 
     Returns:
         advantages  : (total_turns,) tensor
     """
+    if mode == "igpo":
+        return _igpo_advantages(rewards, group_sizes, B, G, device, outcomes, gamma)
+    if outcomes is not None:
+        rewards = rewards.clone()
+        ends    = torch.tensor(group_sizes, device=rewards.device).cumsum(0) - 1
+        rewards[ends] += outcomes.to(rewards.device)
+
     if mode == "echo":
         return _echo_advantages(rewards, group_sizes, B, G, device)
     elif mode == "episode_return":
@@ -136,4 +181,4 @@ def compute_multiturn_advantages(rewards, group_sizes, B, G, mode, device, **kwa
         return _rloo_per_turn_advantages(rewards, group_sizes, B, G, device)
     else:
         raise ValueError(f"Unknown advantage mode: {mode!r}. "
-                         f"Choose from: echo, episode_return, rloo_per_turn")
+                         f"Choose from: echo, episode_return, rloo_per_turn, igpo")

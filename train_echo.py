@@ -57,7 +57,27 @@ N_ARMS    = 5
 MAX_TURNS = 10
 
 ADVANTAGE_MODE  = "echo"   # ECHO uses cross-generation per-turn normalization
-ADVANTAGE_MODES = ("echo", "episode_return", "rloo_per_turn")
+ADVANTAGE_MODES = ("echo", "episode_return", "rloo_per_turn", "igpo")
+
+# env: environment-grounded turn reward; self_ig: IGPO-style gain in the policy's log-prob of the secret
+TURN_REWARD  = "env"
+TURN_REWARDS = ("env", "self_ig")
+SELF_IG_ANSWER_PREFIX = '{"secret":'
+SYSTEM_PROMPT = "You are a helpful assistant. Follow instructions exactly."
+
+
+def build_turn_messages(candidates, arm_histories, turn):
+    prompt_text = build_llm_prompt(
+        candidates    = candidates,
+        arm_histories = arm_histories,
+        turn          = turn,
+        max_turns     = MAX_TURNS,
+        n_arms        = N_ARMS,
+    )
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": prompt_text},
+    ]
 
 # ── reward function ───────────────────────────────────────────────────────────
 
@@ -255,13 +275,15 @@ class ECHOTrainer(GRPOTrainer):
         "resolved", "arm_match_bonus", "diversity_bonus", "redundancy_penalty",
         "resolve_bonus", "efficiency_bonus", "turns_saved", "arm_selected",
         "question", "completion", "turn", "hint",
-        "candidates_before_int", "all_arm_histories_snapshot",
+        "candidates_before_int", "all_arm_histories_snapshot", "self_ig",
     ]
 
-    def __init__(self, *args, train_micro_batch_size=4, advantage_mode=ADVANTAGE_MODE, **kwargs):
+    def __init__(self, *args, train_micro_batch_size=4, advantage_mode=ADVANTAGE_MODE,
+                 turn_reward=TURN_REWARD, **kwargs):
         super().__init__(*args, **kwargs)
         self.train_micro_batch_size = train_micro_batch_size
         self.advantage_mode = advantage_mode
+        self.turn_reward    = turn_reward
         self._clue_logs = {k: [] for k in self.CLUE_LOG_KEYS}
 
         self._clue_reward_func = None
@@ -437,6 +459,8 @@ class ECHOTrainer(GRPOTrainer):
                 for i in range(len(group_sizes))
             ]))
         )
+        if L["self_ig"]:
+            M.setdefault(f"{prefix}clue/self_ig_mean", []).append(self._safe_mean(L["self_ig"]))
         slice_rewards = [info.get("training_reward", 0.0) for info in reward_infos]
         M.setdefault("reward",     []).append(float(np.mean(slice_rewards)))
         M.setdefault("reward_std", []).append(float(np.std(slice_rewards)))
@@ -449,6 +473,7 @@ class ECHOTrainer(GRPOTrainer):
         all_completion_ids = []
         all_rewards        = []
         all_reward_infos   = []
+        all_outcomes       = []
         group_sizes        = []
 
         for secret in secrets:
@@ -458,6 +483,7 @@ class ECHOTrainer(GRPOTrainer):
                 all_completion_ids.extend(episode["completion_ids"])
                 all_rewards.extend(episode["rewards"])
                 all_reward_infos.extend(episode["reward_infos"])
+                all_outcomes.append(episode["outcome"])
                 group_sizes.append(len(episode["rewards"]))
 
         if self.state.global_step % self.args.save_steps == 0:
@@ -527,6 +553,8 @@ class ECHOTrainer(GRPOTrainer):
             G           = self.num_generations,
             mode        = self.advantage_mode,
             device      = device,
+            outcomes    = (torch.tensor(all_outcomes, dtype=torch.float32, device=device)
+                           if self.turn_reward == "self_ig" else None),
         )
 
         self._current_group_sizes = group_sizes
@@ -558,6 +586,26 @@ class ECHOTrainer(GRPOTrainer):
             output["ref_per_token_logps"] = ref_per_token_logps
         return output
 
+    @torch.no_grad()
+    def _secret_logprob(self, candidates, arm_histories, turn, secret, device):
+        """Mean per-token log-prob the current policy assigns to the secret when forced to answer now."""
+        tok    = self.processing_class
+        # past the last turn, condition on the final turn header rather than an out-of-range "Turn 11 of 10"
+        prefix = tok.apply_chat_template(
+            build_turn_messages(candidates, arm_histories, min(turn, MAX_TURNS - 1)),
+            tokenize=False, add_generation_prompt=True,
+        ) + SELF_IG_ANSWER_PREFIX
+        prefix_ids = tok.encode(prefix, return_tensors="pt", add_special_tokens=False)[0]
+        secret_ids = tok.encode(str(secret), return_tensors="pt", add_special_tokens=False)[0]
+        ids = torch.cat([prefix_ids, secret_ids]).unsqueeze(0).to(device)
+
+        was_training = self.model.training
+        self.model.eval()
+        logits = self.model(input_ids=ids).logits[0, prefix_ids.shape[0] - 1:-1].float()
+        self.model.train(was_training)
+        logps = torch.log_softmax(logits, dim=-1).gather(1, secret_ids.to(device).unsqueeze(1))
+        return logps.mean().item()
+
     def _run_single_episode(self, secret, device):
         candidates        = list(range(1, 101))
         arm_histories     = [[] for _ in range(N_ARMS)]
@@ -566,19 +614,12 @@ class ECHOTrainer(GRPOTrainer):
         completion_ids_list = []
         rewards_list      = []
         reward_infos_list = []
+        self_ig = self.turn_reward == "self_ig"
+        if self_ig:
+            secret_logp = self._secret_logprob(candidates, arm_histories, 0, secret, device)
 
         for t in range(MAX_TURNS):
-            prompt_text = build_llm_prompt(
-                candidates    = candidates,
-                arm_histories = arm_histories,
-                turn          = t,
-                max_turns     = MAX_TURNS,
-                n_arms        = N_ARMS,
-            )
-            messages = [
-                {"role": "system", "content": "You are a helpful assistant. Follow instructions exactly."},
-                {"role": "user",   "content": prompt_text},
-            ]
+            messages  = build_turn_messages(candidates, arm_histories, t)
             formatted = self.processing_class.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
@@ -642,6 +683,12 @@ class ECHOTrainer(GRPOTrainer):
             hint = reward_info.get("hint", "I cannot help with that.")
             arm_histories[arm].append((question or "", hint))
 
+            if self_ig:
+                next_logp = self._secret_logprob(candidates, arm_histories, t + 1, secret, device)
+                reward    = next_logp - secret_logp
+                reward_info["self_ig"] = reward
+                secret_logp = next_logp
+
             prompt_ids_list.append(input_ids[0].cpu())
             completion_ids_list.append(new_tokens.cpu())
             rewards_list.append(reward)
@@ -655,6 +702,7 @@ class ECHOTrainer(GRPOTrainer):
             "completion_ids": completion_ids_list,
             "rewards":        rewards_list,
             "reward_infos":   reward_infos_list,
+            "outcome":        float(any(info["resolved"] for info in reward_infos_list)),
         }
 
     def log(self, logs, start_time=None):
@@ -785,6 +833,7 @@ def train(
     log_dir        = None,
     train_micro_batch_size = 4,
     advantage_mode = ADVANTAGE_MODE,
+    turn_reward    = TURN_REWARD,
 ):
     log_dir = Path(log_dir or "clue_grpo_echo")
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -798,7 +847,8 @@ def train(
         set_seed(seed)
 
         now      = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-        run_name = f"{advantage_mode}_{policy_model.split('/')[-1]}_seed{seed}_{now}"
+        reward_tag = "" if turn_reward == "env" else f"_{turn_reward}"
+        run_name = f"{advantage_mode}{reward_tag}_{policy_model.split('/')[-1]}_seed{seed}_{now}"
         run_dir  = log_dir / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -845,6 +895,7 @@ def train(
             processing_class = tokenizer,
             train_micro_batch_size = train_micro_batch_size,
             advantage_mode   = advantage_mode,
+            turn_reward      = turn_reward,
         )
 
         try:
@@ -880,6 +931,7 @@ def train(
         "policy_model": policy_model,
         "max_steps":    max_steps,
         "advantage_mode": advantage_mode,
+        "turn_reward":  turn_reward,
         "run_dirs":     all_run_dirs,
     }
     with open(log_dir / "manifest.json", "w") as f:
@@ -902,7 +954,9 @@ if __name__ == "__main__":
     parser.add_argument("--train-micro-batch-size", type=int, default=4,
                         help="sequences per forward+backward chunk; lower if OOM")
     parser.add_argument("--advantage-mode", type=str, default=ADVANTAGE_MODE, choices=ADVANTAGE_MODES,
-                        help="echo, or a baseline: episode_return (episodic GRPO), rloo_per_turn")
+                        help="echo, or a baseline: episode_return (episodic GRPO), rloo_per_turn, igpo")
+    parser.add_argument("--turn-reward", type=str, default=TURN_REWARD, choices=TURN_REWARDS,
+                        help="env: environment reward; self_ig: IGPO-style policy log-prob gain on the secret + resolve outcome")
     args = parser.parse_args()
 
     train(
@@ -916,4 +970,5 @@ if __name__ == "__main__":
         save_every = args.save_every,
         train_micro_batch_size = args.train_micro_batch_size,
         advantage_mode = args.advantage_mode,
+        turn_reward    = args.turn_reward,
     )
