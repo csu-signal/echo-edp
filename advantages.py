@@ -9,6 +9,7 @@ Baselines included:
   episode_return  — REINFORCE: sum rewards per episode, same value broadcast to all turns
   rloo_per_turn   — leave-one-out per turn
   igpo            — IGPO: group-pooled turn normalization + turn-level reward-to-go
+  echo_rtg        — ECHO's per-turn normalization applied to raw reward-to-go
 """
 
 import torch
@@ -148,6 +149,20 @@ def _igpo_advantages(rewards, group_sizes, B, G, device, outcomes=None, gamma=1.
     return advantages
 
 
+def _echo_rtg_advantages(rewards, group_sizes, B, G, device, gamma=1.0):
+    """Discounted reward-to-go per turn, then normalized exactly as in ECHO."""
+    rtg = torch.zeros_like(rewards)
+    flat_idx = 0
+    for ep_size in group_sizes:
+        running = 0.0
+        for i in range(flat_idx + ep_size - 1, flat_idx - 1, -1):
+            running = rewards[i] + gamma * running
+            rtg[i] = running
+        flat_idx += ep_size
+
+    return _echo_advantages(rtg, group_sizes, B, G, device)
+
+
 def compute_multiturn_advantages(rewards, group_sizes, B, G, mode, device, outcomes=None, gamma=1.0):
     """
     Dispatcher for all advantage modes.
@@ -157,11 +172,11 @@ def compute_multiturn_advantages(rewards, group_sizes, B, G, mode, device, outco
         group_sizes : list of ints — turns per episode, len = B*G
         B           : number of secrets in this batch
         G           : number of generations per secret
-        mode        : "echo" | "episode_return" | "rloo_per_turn" | "igpo"
+        mode        : "echo" | "episode_return" | "rloo_per_turn" | "igpo" | "echo_rtg"
         device      : torch device string
         outcomes    : optional (B*G,) episode outcome rewards; igpo normalizes them separately,
                       other modes add them to each episode's final turn reward
-        gamma       : turn-level discount for igpo
+        gamma       : turn-level discount for igpo and echo_rtg
 
     Returns:
         advantages  : (total_turns,) tensor
@@ -179,6 +194,8 @@ def compute_multiturn_advantages(rewards, group_sizes, B, G, mode, device, outco
         return _episode_return_advantages(rewards, group_sizes, B, G, device)
     elif mode == "rloo_per_turn":
         return _rloo_per_turn_advantages(rewards, group_sizes, B, G, device)
+    elif mode == "echo_rtg":
+        return _echo_rtg_advantages(rewards, group_sizes, B, G, device, gamma)
     else:
         raise ValueError(f"Unknown advantage mode: {mode!r}. "
-                         f"Choose from: echo, episode_return, rloo_per_turn, igpo")
+                         f"Choose from: echo, episode_return, rloo_per_turn, igpo, echo_rtg")
