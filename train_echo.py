@@ -57,7 +57,7 @@ N_ARMS    = 5
 MAX_TURNS = 10
 
 ADVANTAGE_MODE  = "echo"   # ECHO uses cross-generation per-turn normalization
-ADVANTAGE_MODES = ("echo", "episode_return", "rloo_per_turn", "igpo")
+ADVANTAGE_MODES = ("echo", "episode_return", "rloo_per_turn", "igpo", "echo_rtg")
 
 # env: environment-grounded turn reward; self_ig: IGPO-style gain in the policy's log-prob of the secret
 TURN_REWARD  = "env"
@@ -399,12 +399,39 @@ class ECHOTrainer(GRPOTrainer):
                 with self.compute_loss_context_manager():
                     loss = self.compute_loss(model, chunk)
                 self.accelerator.backward(loss)
+                if not torch.isfinite(loss) or any(
+                    p.grad is not None and not torch.isfinite(p.grad).all() for p in model.parameters()
+                ):
+                    self._dump_nonfinite(model, chunk, loss, start)
                 total_loss += loss.detach()
                 del chunk, loss
         finally:
             self.current_gradient_accumulation_steps = prev_gas
 
         return total_loss
+
+    @torch.no_grad()
+    def _dump_nonfinite(self, model, chunk, loss, chunk_start):
+        """Save the chunk that produced a non-finite loss or gradient, then stop training."""
+        prompt_completion_ids = torch.cat([chunk["prompt_ids"], chunk["completion_ids"]], dim=1)
+        attention_mask = torch.cat([chunk["prompt_mask"], chunk["completion_mask"]], dim=1)
+        new_logps, _, _ = self._get_per_token_logps_and_entropies(
+            model, prompt_completion_ids, attention_mask, chunk["completion_ids"].shape[1],
+            batch_size=chunk["completion_ids"].shape[0], compute_entropy=False,
+        )
+        bad_params = [n for n, p in model.named_parameters()
+                      if p.grad is not None and not torch.isfinite(p.grad).all()]
+        dump = {
+            "global_step": self.state.global_step,
+            "chunk_start": chunk_start,
+            "loss": loss.detach().float().cpu(),
+            "bad_grad_params": bad_params,
+            "new_per_token_logps": new_logps.float().cpu(),
+            **{k: v.detach().cpu() for k, v in chunk.items() if isinstance(v, torch.Tensor)},
+        }
+        path = Path(self.args.output_dir) / f"nonfinite_step{self.state.global_step}.pt"
+        torch.save(dump, path)
+        raise RuntimeError(f"non-finite loss/grad at step {self.state.global_step}; dumped to {path}")
 
     def _split_by_episodes(self, output, group_sizes, steps_per_generation):
         ep_per_step    = len(group_sizes) // steps_per_generation
@@ -954,7 +981,7 @@ if __name__ == "__main__":
     parser.add_argument("--train-micro-batch-size", type=int, default=4,
                         help="sequences per forward+backward chunk; lower if OOM")
     parser.add_argument("--advantage-mode", type=str, default=ADVANTAGE_MODE, choices=ADVANTAGE_MODES,
-                        help="echo, or a baseline: episode_return (episodic GRPO), rloo_per_turn, igpo")
+                        help="echo, or a baseline: episode_return (episodic GRPO), rloo_per_turn, igpo, echo_rtg")
     parser.add_argument("--turn-reward", type=str, default=TURN_REWARD, choices=TURN_REWARDS,
                         help="env: environment reward; self_ig: IGPO-style policy log-prob gain on the secret + resolve outcome")
     args = parser.parse_args()

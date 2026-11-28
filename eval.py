@@ -39,7 +39,7 @@ from openai import OpenAI
 from environment import (
     filter_candidates, call_clue_holder, build_llm_prompt,
     parse_llm_response, ARM_PROPERTIES, sanitize_hint,
-    POLICY_TOP_K, POLICY_REPETITION_PENALTY,
+    POLICY_TOP_K, POLICY_REPETITION_PENALTY, CLUE_MODEL, DEFAULT_CLUE_MODEL,
 )
 
 load_dotenv()
@@ -49,7 +49,7 @@ load_dotenv()
 N_ARMS       = 5
 MAX_TURNS    = 10
 DEVICE       = "cuda:0"
-RESULTS_DIR  = Path("eval_results")
+RESULTS_DIR  = Path("eval_results" if CLUE_MODEL == DEFAULT_CLUE_MODEL else f"eval_results_oracle_{CLUE_MODEL}")
 OUT_DIR      = RESULTS_DIR / "per_target"
 SECRETS_PATH = Path("eval_results/canonical_secrets.json")
 EVAL_SEEDS   = [42, 123, 7]

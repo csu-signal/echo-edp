@@ -2,7 +2,7 @@
 Clue Selector Game (CSG) — environment core.
 
 Covers:
-  - GPT-4o-mini oracle (call_clue_holder)
+  - LLM oracle (call_clue_holder; gpt-4o-mini by default, CLUE_MODEL env to override)
   - Deterministic oracle fallback (simulate_hint)
   - Belief update operator (filter_candidates)
   - Arm property definitions (ARM_PROPERTIES, PROPERTY_QUESTIONS)
@@ -22,7 +22,12 @@ from prompts import ORACLE_SYSTEM_PROMPT, ORACLE_PROMPT_TEMPLATE, build_selector
 
 load_dotenv()
 client    = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-CLUE_MODEL = "gpt-4o-mini"
+DEFAULT_CLUE_MODEL = "gpt-4o-mini"
+CLUE_MODEL = os.getenv("CLUE_MODEL", DEFAULT_CLUE_MODEL)
+anthropic_client = None
+if CLUE_MODEL.startswith("claude"):
+    import anthropic
+    anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY"))
 POLICY_TOP_K              = 20
 POLICY_REPETITION_PENALTY = 1.1
 
@@ -81,12 +86,23 @@ def sanitize_hint(hint, secret):
 # ── oracle ────────────────────────────────────────────────────────────────────
 
 def call_clue_holder(question, secret, candidates, max_retries=5):
-    """Call GPT-4o-mini oracle. Returns one-sentence hint or None on failure."""
+    """Call the CLUE_MODEL oracle. Returns one-sentence hint or None on failure."""
     prompt = sanitize_for_api(
         ORACLE_PROMPT_TEMPLATE.format(secret=secret, question=question)
     )
     for attempt in range(max_retries):
         try:
+            if anthropic_client is not None:
+                # default temperature: recent Claude models reject a non-default one; thinking off so the
+                # 60-token budget goes to the hint
+                response = anthropic_client.messages.create(
+                    model    = CLUE_MODEL,
+                    system   = ORACLE_SYSTEM_PROMPT,
+                    messages = [{"role": "user", "content": prompt}],
+                    max_tokens = 60,
+                    thinking = {"type": "disabled"},
+                )
+                return "".join(b.text for b in response.content if b.type == "text").strip()
             response = client.chat.completions.create(
                 model    = CLUE_MODEL,
                 messages = [
